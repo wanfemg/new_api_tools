@@ -5,7 +5,7 @@ set -euo pipefail
 # NewAPI Middleware Tool - 快速安装脚本
 #
 # 用法:
-#   bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main/install.sh)
+#   bash <(curl -sSL https://raw.githubusercontent.com/wanfemg/new_api_tools/main/install.sh)
 #
 # 功能:
 #   1. 自动检测 NewAPI 安装目录
@@ -27,7 +27,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 die() { log_error "$*"; exit 1; }
 
-REPO_URL="https://github.com/james-6-23/new_api_tools.git"
+REPO_URL="https://github.com/wanfemg/new_api_tools.git"
 PROJECT_NAME="new_api_tools"
 REINSTALL=false
 
@@ -452,10 +452,11 @@ show_management_menu() {
       echo " 11) 安全设置     (切换 SERVER_HOST / 切换前端端口暴露范围)"
     fi
     echo " 12) 下载 GeoIP   (可选：IP 地理定位，约 70MB，需访问外网)"
+    echo " 13) IP 透传体检  (修复 CDN 场景下记录成 CDN IP 的问题)"
     echo ""
     echo "  0) 退出"
     echo ""
-    read -r -p "请选择操作 [0-12]: " choice
+    read -r -p "请选择操作 [0-13]: " choice
 
     case "$choice" in
       1)
@@ -528,6 +529,11 @@ show_management_menu() {
         echo ""
         read -r -p "按回车键继续..."
         ;;
+      13)
+        do_trusted_proxies_interactive
+        echo ""
+        read -r -p "按回车键继续..."
+        ;;
       0|"")
         log_info "退出"
         exit 0
@@ -538,6 +544,266 @@ show_management_menu() {
     esac
   done
 }
+
+
+#######################################
+# IP 透传（X-Forwarded-For）配置治理
+#
+# 背景：NewAPI 用 Gin 的 c.ClientIP() 写 logs.ip。Gin 只有在「直连对端命中
+# 可信代理列表」时才采信 X-Forwarded-For，否则直接把直连对端地址当客户端 IP。
+# NewAPI 的 TRUSTED_PROXIES 未显式配置时只信任回环 / RFC1918 / fc00::/7，
+# 于是「站点套了公网 CDN」这种部署下，CDN 回源是公网地址 → XFF 被整体丢弃
+# → logs.ip 全是 CDN 回源 IP。
+#
+# 这里只写 NewAPI 的 .env 与一份 compose 覆盖层，不碰 NewAPI 源码。
+# 写入落在 .env（更新镜像不会丢），覆盖层作为第二落点（防 .env 被上游模板覆盖）。
+#######################################
+
+IP_TRUST_DOTENV_BEGIN="# >>> newapi-tools: TRUSTED_PROXIES (managed block) >>>"
+IP_TRUST_DOTENV_END="# <<< newapi-tools: TRUSTED_PROXIES <<<"
+IP_TRUST_OVERLAY="docker-compose.trusted-proxies.yml"
+
+### 读取指定 NewAPI 容器当前生效的 TRUSTED_PROXIES（不存在则输出空）###
+get_newapi_trusted_proxies() {
+  local cid="$1"
+  [[ -z "$cid" ]] && return 0
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null \
+    | awk -F= '$1=="TRUSTED_PROXIES"{sub(/^TRUSTED_PROXIES=/,""); print; exit}'
+}
+
+### 读取 NewAPI compose 项目目录（.env 与覆盖层都写这里）###
+find_newapi_compose_dir() {
+  local cid="$1" dir=""
+  [[ -z "$cid" ]] && return 1
+
+  dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$cid" 2>/dev/null || true)
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    echo "$dir"
+    return 0
+  fi
+
+  local cfg
+  cfg=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$cid" 2>/dev/null || true)
+  if [[ -n "$cfg" ]]; then
+    cfg="${cfg%%,*}"
+    if [[ -f "$cfg" ]]; then
+      dirname "$cfg"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+### 校验并规范化一条 TRUSTED_PROXIES 值；合法则输出规范化结果 ###
+normalize_trusted_proxies() {
+  local raw="$1"
+  local -a items=()
+  local -a out=()
+  local item seen="|"
+
+  IFS=',' read -r -a items <<< "$raw"
+  for item in "${items[@]}"; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [[ -z "$item" ]] && continue
+
+    if [[ "$item" =~ ^(0\.0\.0\.0/0|::/0)$ ]]; then
+      log_error "拒绝 TRUSTED_PROXIES=${item}：这会让任意客户端伪造 X-Forwarded-For，击穿 token 的 IP 白名单鉴权"
+      return 1
+    fi
+
+    if [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      item="${item}/32"
+    elif [[ "$item" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+      local bits="${item##*/}"
+      if (( bits > 32 )); then
+        log_error "非法 CIDR: $item"
+        return 1
+      fi
+    fi
+
+    if [[ "$seen" == *"|${item}|"* ]]; then
+      continue
+    fi
+    seen="${seen}${item}|"
+    out+=("$item")
+  done
+
+  if [[ ${#out[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  # 逐行输出后再排序拼接：直接对 join 结果排序会连分隔符一起打乱。
+  printf '%s\n' "${out[@]}" | sort | paste -sd, -
+}
+
+### 写入 .env 标记块（幂等：先删旧块再追加）###
+write_trusted_proxies_dotenv() {
+  local env_file="$1" value="$2" tmp
+  if [[ ! -f "$env_file" ]]; then
+    log_warn "未找到 ${env_file}，跳过 .env 写入"
+    return 1
+  fi
+
+  tmp="$(mktemp)"
+  awk -v b="$IP_TRUST_DOTENV_BEGIN" -v e="$IP_TRUST_DOTENV_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    skip != 1 { print }
+  ' "$env_file" > "$tmp"
+
+  {
+    echo "$IP_TRUST_DOTENV_BEGIN"
+    echo "# 由 new_api_tools 生成。作用是让 NewAPI(Gin) 采信 CDN 回源带来的"
+    echo "# X-Forwarded-For，从而把真实用户 IP 写入 logs.ip。"
+    echo "# 手工维护此块会被下次「IP 透传体检」覆盖。"
+    echo "TRUSTED_PROXIES=${value}"
+    echo "$IP_TRUST_DOTENV_END"
+  } >> "$tmp"
+
+  cp "$env_file" "${env_file}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  cat "$tmp" > "$env_file"
+  rm -f "$tmp"
+  return 0
+}
+
+### 写入 compose 覆盖层（第二落点）###
+write_trusted_proxies_overlay() {
+  local compose_dir="$1" value="$2" service="${3:-new-api}"
+  cat > "${compose_dir}/${IP_TRUST_OVERLAY}" <<EOF
+# 由 new_api_tools 生成，用于 NewAPI 的 IP 透传（X-Forwarded-For）。
+# 更新 NewAPI 时请沿用：
+#   docker compose -f docker-compose.yml -f ${IP_TRUST_OVERLAY} up -d
+# 若只跑 docker compose up -d，则依赖 .env 中同名的 TRUSTED_PROXIES。
+services:
+  ${service}:
+    environment:
+      TRUSTED_PROXIES: "\${TRUSTED_PROXIES:-${value}}"
+EOF
+}
+
+### 应用配置：写 .env + 覆盖层，并按需重启 NewAPI ###
+apply_trusted_proxies() {
+  local cid="$1" value="$2" restart="${3:-true}"
+  local compose_dir
+
+  compose_dir="$(find_newapi_compose_dir "$cid" || true)"
+  if [[ -z "$compose_dir" ]]; then
+    log_error "无法定位 NewAPI 的 compose 目录，无法写入配置"
+    log_info "请手工在 NewAPI 的 .env 中加入：TRUSTED_PROXIES=${value}"
+    return 1
+  fi
+
+  local wrote=0
+  if write_trusted_proxies_dotenv "${compose_dir}/.env" "$value"; then
+    log_success "已写入 ${compose_dir}/.env"
+    wrote=1
+  fi
+  write_trusted_proxies_overlay "$compose_dir" "$value"
+  log_success "已写入 ${compose_dir}/${IP_TRUST_OVERLAY}"
+
+  if [[ "$wrote" != "1" ]]; then
+    return 1
+  fi
+
+  if [[ "$restart" == "true" ]]; then
+    log_info "重启 NewAPI 以应用新配置..."
+    if docker restart "$cid" >/dev/null 2>&1; then
+      log_success "NewAPI 已重启"
+    else
+      log_error "NewAPI 重启失败，请手工执行: docker restart ${cid}"
+      return 1
+    fi
+    sleep 5
+    local now
+    now="$(get_newapi_trusted_proxies "$cid")"
+    if [[ "$now" == "$value" ]]; then
+      log_success "校验通过：容器内 TRUSTED_PROXIES=${now}"
+    else
+      log_warn "校验不一致：容器内为 '${now}'，期望 '${value}'"
+      log_info "可能原因：NewAPI 使用 docker run 启动，环境变量来自启动参数而非 .env"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+### 交互式配置入口 ###
+do_trusted_proxies_interactive() {
+  local cid
+  cid="$(find_newapi_container || true)"
+
+  echo ""
+  echo -e "${BLUE}========================================${NC}"
+  echo -e "${BLUE}          IP 透传（真实 IP）体检${NC}"
+  echo -e "${BLUE}========================================${NC}"
+  echo ""
+
+  if [[ -z "$cid" ]]; then
+    log_error "未找到运行中的 NewAPI 容器，无法体检"
+    log_info "可设置 NEWAPI_CONTAINER=<容器名> 后重试"
+    return 1
+  fi
+
+  local current
+  current="$(get_newapi_trusted_proxies "$cid")"
+
+  echo -e "  NewAPI 容器: ${GREEN}${cid}${NC}"
+  if [[ -z "$current" ]]; then
+    echo -e "  TRUSTED_PROXIES: ${YELLOW}未配置${NC}"
+    echo -e "  ${YELLOW}→ NewAPI 只信任回环/私网；CDN 公网回源时 X-Forwarded-For 会被丢弃${NC}"
+    echo -e "  ${YELLOW}→ 结果是 logs.ip 记录成 CDN 回源 IP，IP 分析全部失真${NC}"
+  elif [[ "$current" == "none" ]]; then
+    echo -e "  TRUSTED_PROXIES: ${YELLOW}none（严格模式）${NC}"
+    echo -e "  ${YELLOW}→ 不信任任何代理，同样拿不到真实 IP${NC}"
+  else
+    echo -e "  TRUSTED_PROXIES: ${GREEN}${current}${NC}"
+  fi
+  echo ""
+
+  echo -e "${YELLOW}注意：显式列表会完全替代 NewAPI 的默认值（回环 + RFC1918 + fc00::/7）。${NC}"
+  echo -e "${YELLOW}如果你在 NewAPI 前面还有一层本机 nginx/容器反代，必须一并加入 127.0.0.1。${NC}"
+  echo ""
+
+  read -r -p "是否现在配置 CDN 回源段？[y/N]: " go
+  [[ "$go" =~ ^[yY]$ ]] || { log_info "已跳过"; return 0; }
+
+  echo ""
+  echo "常见 CDN 的回源段请到厂商控制台获取后粘贴，多个用逗号分隔。"
+  echo "示例: 203.0.113.0/24,198.51.100.0/24"
+  echo ""
+  read -r -p "CDN 回源 IP/CIDR: " cdn_entries
+
+  read -r -p "NewAPI 前面还有本机反向代理吗？[y/N]: " has_local
+  local value
+  if [[ "$has_local" =~ ^[yY]$ ]]; then
+    value="127.0.0.1,${cdn_entries}"
+  else
+    value="$cdn_entries"
+  fi
+
+  value="$(normalize_trusted_proxies "$value" || true)"
+  if [[ -z "$value" ]]; then
+    log_error "没有可用的有效配置，已取消"
+    return 1
+  fi
+
+  echo ""
+  echo -e "  将写入: ${GREEN}TRUSTED_PROXIES=${value}${NC}"
+  echo ""
+  read -r -p "确认写入并重启 NewAPI？[y/N]: " ok
+  [[ "$ok" =~ ^[yY]$ ]] || { log_info "已取消"; return 0; }
+
+  apply_trusted_proxies "$cid" "$value" true
+
+  echo ""
+  echo -e "${YELLOW}重要说明：${NC}"
+  echo "  1. 历史日志里的 CDN IP 无法还原，只有新请求会记录真实 IP"
+  echo "  2. 若 CDN 未透传 X-Forwarded-For，配置后仍不会有真实 IP"
+  echo "  3. 更新 NewAPI 后请回到本菜单复查"
+  echo ""
+  return 0
+}
+
 
 #######################################
 # 安全设置子菜单
@@ -1457,6 +1723,46 @@ run_deploy() {
   exec "${PROJECT_DIR}/deploy.sh"
 }
 
+
+#######################################
+# 安装后的 IP 透传引导
+#
+# 定位：只在「检测到 NewAPI 容器」且「TRUSTED_PROXIES 未正确配置」时提示。
+# 不强制、不自动改，因为改错（例如填 0.0.0.0/0）会击穿 NewAPI 的 IP 白名单鉴权。
+#######################################
+guide_trusted_proxies_after_install() {
+  local cid current
+
+  cid="$(find_newapi_container || true)"
+  [[ -z "$cid" ]] && return 0
+
+  current="$(get_newapi_trusted_proxies "$cid")"
+  if [[ -n "$current" && "$current" != "none" ]]; then
+    log_success "NewAPI 已配置 TRUSTED_PROXIES: ${current}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}========================================${NC}"
+  echo -e "${YELLOW}  IP 透传体检（可选）${NC}"
+  echo -e "${YELLOW}========================================${NC}"
+  echo ""
+  if [[ -z "$current" ]]; then
+    echo -e "  当前 NewAPI 未设置 TRUSTED_PROXIES"
+  else
+    echo -e "  当前 TRUSTED_PROXIES=none（不信任任何代理）"
+  fi
+  echo -e "  ${YELLOW}如果你的站点套了 CDN，本工具的 IP 分析会全部显示 CDN 回源 IP。${NC}"
+  echo -e "  ${YELLOW}如果你没有套 CDN，跳过即可，不影响其它功能。${NC}"
+  echo ""
+  read -r -p "现在配置 CDN 回源段吗？[y/N]: " go
+  if [[ "$go" =~ ^[yY]$ ]]; then
+    do_trusted_proxies_interactive
+  else
+    log_info "已跳过。之后可在管理菜单选「13) IP 透传体检」重新配置"
+  fi
+}
+
 #######################################
 # 查找已安装的项目目录
 #######################################
@@ -1520,7 +1826,7 @@ NewAPI Middleware Tool - 安装管理脚本
   PROJECT_DIR      指定项目目录（默认: 自动检测）
   NEWAPI_CONTAINER 指定 NewAPI 容器名（默认: 自动检测）
 
-更多信息: https://github.com/james-6-23/new_api_tools
+更多信息: https://github.com/wanfemg/new_api_tools
 EOF
 }
 
@@ -1554,6 +1860,7 @@ main() {
   detect_newapi_location
   check_existing_installation
   clone_or_update_project
+  guide_trusted_proxies_after_install
   run_deploy
 }
 

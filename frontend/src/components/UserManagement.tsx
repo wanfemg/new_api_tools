@@ -103,6 +103,7 @@ export function UserManagement() {
   const [activeTab, setActiveTab] = useState<'list' | 'affiliate' | 'panel-whitelist'>('list')
   const [stats, setStats] = useState<ActivityStats | null>(null)
   const [users, setUsers] = useState<UserInfo[]>([])
+  const [recentIPs, setRecentIPs] = useState<Record<number, { ip: string; geo_label: string; risk_flags: string[] }>>({})
   const [loading, setLoading] = useState(true)
   const [page, setPage] = useState(1)
   const [pageSize] = useState(20)
@@ -372,6 +373,13 @@ export function UserManagement() {
         setUsers(data.data.items)
         setTotal(data.data.total)
         setTotalPages(data.data.total_pages)
+        const ids = (data.data.items as UserInfo[]).map((u) => u.id).filter((id) => id > 0)
+        if (ids.length > 0) {
+          fetch(`${apiUrl}/api/fingerprint/users/recent?user_ids=${ids.join(',')}`, { headers: getAuthHeaders() })
+            .then((r) => r.json())
+            .then((res) => { if (res.success) setRecentIPs(res.data || {}) })
+            .catch(() => {})
+        }
       }
     } catch (error) {
       console.error('Failed to fetch users:', error)
@@ -1014,6 +1022,7 @@ export function UserManagement() {
                     <TableHead className="text-right hidden sm:table-cell">已用</TableHead>
                     <TableHead className="text-right hidden md:table-cell">请求数</TableHead>
                     <TableHead className="hidden md:table-cell">最后请求</TableHead>
+                    <TableHead className="hidden xl:table-cell">最近 IP</TableHead>
                     <TableHead>活跃度</TableHead>
                     <TableHead className="w-20">操作</TableHead>
                   </TableRow>
@@ -1101,6 +1110,26 @@ export function UserManagement() {
                         {user.request_count.toLocaleString()}
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-xs whitespace-nowrap tabular-nums text-muted-foreground">{formatLastRequest(user)}</TableCell>
+                      <TableCell className="hidden xl:table-cell">
+                        {recentIPs[user.id] ? (
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-1 whitespace-nowrap">
+                              <span className="font-mono text-xs">{recentIPs[user.id].ip}</span>
+                              {recentIPs[user.id].geo_label && (
+                                <span className="text-[10px] text-muted-foreground">{recentIPs[user.id].geo_label}</span>
+                              )}
+                            </div>
+                            {(recentIPs[user.id].risk_flags || []).map((f) => (
+                              <span key={f} className="inline-flex items-center gap-1 text-[10px] text-red-600 dark:text-red-400">
+                                <AlertTriangle className="w-3 h-3 shrink-0" />
+                                {f === 'SAME_IP_MULTI_ACCOUNT' ? '同 IP 多账号' : f === 'MULTI_IP_ACCOUNT' ? '同账号多 IP' : f}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">-</span>
+                        )}
+                      </TableCell>
                       <TableCell>{getActivityBadge(user.activity_level)}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">

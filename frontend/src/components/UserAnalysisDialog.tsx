@@ -14,6 +14,7 @@ import {
     Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter,
 } from './ui/dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs'
 import { cn, isCloudflareIp } from '../lib/utils'
 
 // ── 类型定义 ──────────────────────────────────────────
@@ -239,6 +240,9 @@ export function UserAnalysisDialog({
     const [analysisWindow, setAnalysisWindow] = useState<string>(initialWindow || '24h')
     const [analysis, setAnalysis] = useState<UserAnalysis | null>(null)
     const [analysisLoading, setAnalysisLoading] = useState(false)
+    const [detailTab, setDetailTab] = useState<'overview' | 'ips' | 'fingerprint'>('overview')
+    const [fingerprint, setFingerprint] = useState<{ device_fp: string; identity_fp: string; same_device: Array<{ user_id: number; username: string }>; risk_flags: string[] } | null>(null)
+    const [fingerprintLoading, setFingerprintLoading] = useState(false)
     const [linuxDoLookupLoading, setLinuxDoLookupLoading] = useState<string | null>(null)
     const [mutating, setMutating] = useState(false)
     const [banConfirmDialog, setBanConfirmDialog] = useState<{
@@ -283,6 +287,25 @@ export function UserAnalysisDialog({
             setAnalysisLoading(false)
         }
     }, [apiUrl, getAuthHeaders, userId, analysisWindow, open, showToast, endTime])
+
+    // 拉取设备指纹（进「设备指纹」页签时）
+    const fetchFingerprint = useCallback(async () => {
+        if (!userId || !open) return
+        setFingerprintLoading(true)
+        try {
+            const response = await fetch(`${apiUrl}/api/fingerprint/users/${userId}`, { headers: getAuthHeaders() })
+            const res = await response.json()
+            if (res.success) setFingerprint(res.data)
+        } catch (e) {
+            console.error('Failed to fetch fingerprint:', e)
+        } finally {
+            setFingerprintLoading(false)
+        }
+    }, [apiUrl, getAuthHeaders, userId, open])
+
+    useEffect(() => {
+        if (detailTab === 'fingerprint') fetchFingerprint()
+    }, [detailTab, fetchFingerprint])
 
     // Reset window when dialog opens with a new initialWindow
     useEffect(() => {
@@ -504,7 +527,13 @@ export function UserAnalysisDialog({
                                 <p>正在分析用户行为数据...</p>
                             </div>
                         ) : analysis ? (
-                            <div className="space-y-6">
+                            <Tabs value={detailTab} onValueChange={(v) => setDetailTab(v as 'overview' | 'ips' | 'fingerprint')}>
+                                <TabsList className="grid w-full max-w-sm grid-cols-3 mb-4">
+                                    <TabsTrigger value="overview">概览</TabsTrigger>
+                                    <TabsTrigger value="ips">IP 历史</TabsTrigger>
+                                    <TabsTrigger value="fingerprint">设备指纹</TabsTrigger>
+                                </TabsList>
+                                <TabsContent value="overview" className="space-y-6 mt-0">
                                 {/* Risk Flags */}
                                 <div className="flex flex-wrap items-center gap-2">
                                     <Badge variant="secondary" className="px-3 py-1 bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
@@ -946,7 +975,69 @@ export function UserAnalysisDialog({
 
                                 {/* Extra content (e.g. invited users in UserManagement) */}
                                 {renderExtra?.(analysis)}
-                            </div>
+                                </TabsContent>
+
+                                <TabsContent value="ips" className="mt-0">
+                                    {analysis.top_ips.length > 0 ? (
+                                        <div className="rounded-md border overflow-hidden">
+                                            <Table>
+                                                <TableHeader><TableRow><TableHead>IP</TableHead><TableHead>地理</TableHead><TableHead className="text-right">请求数</TableHead></TableRow></TableHeader>
+                                                <TableBody>
+                                                    {analysis.top_ips.map((ipItem) => (
+                                                        <TableRow key={ipItem.ip}>
+                                                            <TableCell className="font-mono text-xs">{ipItem.ip}</TableCell>
+                                                            <TableCell className="text-xs text-muted-foreground">{ipItem.geo_label || '-'}</TableCell>
+                                                            <TableCell className="text-right tabular-nums">{ipItem.requests.toLocaleString()}</TableCell>
+                                                        </TableRow>
+                                                    ))}
+                                                </TableBody>
+                                            </Table>
+                                        </div>
+                                    ) : (
+                                        <div className="h-40 flex items-center justify-center text-muted-foreground">暂无 IP 记录</div>
+                                    )}
+                                </TabsContent>
+
+                                <TabsContent value="fingerprint" className="mt-0 space-y-4">
+                                    {fingerprintLoading ? (
+                                        <div className="h-40 flex items-center justify-center text-muted-foreground"><Loader2 className="h-6 w-6 animate-spin mr-2" />加载设备指纹...</div>
+                                    ) : fingerprint ? (
+                                        <>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <Badge variant="secondary" className="px-3 py-1 bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">设备指纹</Badge>
+                                                <span className="font-mono text-xs text-muted-foreground break-all">{fingerprint.device_fp || '-'}</span>
+                                            </div>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <Badge variant="secondary" className="px-3 py-1 bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">复合身份指纹</Badge>
+                                                <span className="font-mono text-xs text-muted-foreground break-all">{fingerprint.identity_fp || '-'}</span>
+                                            </div>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                {(fingerprint.risk_flags || []).map((f) => (
+                                                    <Badge key={f} variant="destructive" className="px-3 py-1 animate-pulse"><AlertTriangle className="w-3 h-3 mr-1" />{f === 'SAME_IP_MULTI_ACCOUNT' ? '同 IP 多账号' : f === 'MULTI_IP_ACCOUNT' ? '同账号多 IP' : f}</Badge>
+                                                ))}
+                                                {(fingerprint.risk_flags || []).length === 0 && <Badge variant="success" className="px-3 py-1"><ShieldCheck className="w-3 h-3 mr-1" />无明显异常</Badge>}
+                                            </div>
+                                            <div>
+                                                <h4 className="text-sm font-semibold text-muted-foreground mb-2">同设备账号（{fingerprint.same_device?.length ?? 0}）</h4>
+                                                {(fingerprint.same_device || []).length > 0 ? (
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {fingerprint.same_device.map((u) => (
+                                                            <Badge key={u.user_id} variant="outline" className="px-2 py-1 font-normal">{u.username}<span className="ml-1 text-muted-foreground">#{u.user_id}</span></Badge>
+                                                        ))}
+                                                    </div>
+                                                ) : (
+                                                    <div className="text-xs text-muted-foreground italic">无</div>
+                                                )}
+                                            </div>
+                                            <div className="text-xs text-muted-foreground bg-muted/30 rounded-md p-3">
+                                                设备指纹 = SHA256(salt+ip)（跨 token/账号关联同一网络出口）；复合身份指纹 = SHA256(salt+ip+token_id+user_id)。仅提示人工复核，不自动封禁。
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <div className="h-40 flex items-center justify-center text-muted-foreground">暂无设备指纹数据</div>
+                                    )}
+                                </TabsContent>
+                            </Tabs>
                         ) : (
                             <div className="h-full flex items-center justify-center text-muted-foreground">
                                 暂无分析数据

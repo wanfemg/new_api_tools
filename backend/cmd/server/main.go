@@ -99,6 +99,7 @@ func main() {
 		// Phase 2.3: IP Monitoring, Risk Monitoring, Model Status
 		handler.RegisterIPMonitoringRoutes(api)
 		handler.RegisterRiskMonitoringRoutes(api)
+		handler.RegisterDeviceFingerprintRoutes(api)
 		handler.RegisterModelStatusRoutes(api)
 		handler.RegisterAbuseBroadcastRoutes(api)
 
@@ -130,6 +131,9 @@ func main() {
 	stopAbuseBroadcast := make(chan struct{})
 	go backgroundSyncAbuseBroadcast(stopAbuseBroadcast)
 
+	stopFingerprint := make(chan struct{})
+	go backgroundRebuildFingerprint(stopFingerprint)
+
 	// ========== 8. Start server with graceful shutdown ==========
 	srv := &http.Server{
 		Addr:         cfg.ServerAddr(),
@@ -157,6 +161,7 @@ func main() {
 	// Stop background tasks
 	close(stopIPEnforce)
 	close(stopAbuseBroadcast)
+	close(stopFingerprint)
 
 	// Give the server 10 seconds to finish processing requests
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -234,6 +239,53 @@ func enforceIPRecordingOnce() {
 	}
 
 	logger.L.Success(fmt.Sprintf("[IP记录] %s", result["message"]))
+}
+
+// backgroundRebuildFingerprint periodically rebuilds the local device-fingerprint
+// snapshot from logs (24h window) so the fingerprint risk views stay fresh.
+func backgroundRebuildFingerprint(stop <-chan struct{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.L.Error(fmt.Sprintf("[设备指纹] 后台重建任务 panic: %v", r))
+		}
+	}()
+
+	select {
+	case <-time.After(15 * time.Second):
+	case <-stop:
+		return
+	}
+
+	logger.L.System("[设备指纹] 快照重建任务已启动 (间隔: 10分钟)")
+	rebuildFingerprintOnce()
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rebuildFingerprintOnce()
+		case <-stop:
+			logger.L.System("[设备指纹] 快照重建任务已停止")
+			return
+		}
+	}
+}
+
+func rebuildFingerprintOnce() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.L.Error(fmt.Sprintf("[设备指纹] 重建执行 panic: %v", r))
+		}
+	}()
+
+	svc := service.NewDeviceFingerprintService()
+	written, err := svc.RebuildSnapshot(context.Background(), 24*3600)
+	if err != nil {
+		logger.L.Warn("[设备指纹] 快照重建失败: " + err.Error())
+		return
+	}
+	logger.L.System(fmt.Sprintf("[设备指纹] 快照重建完成，写入 %d 行", written))
 }
 
 // backgroundSyncAbuseBroadcast supervises the Hub pull loop. It re-reads the

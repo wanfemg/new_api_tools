@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
-import { RefreshCw, ShieldBan, ShieldCheck, Loader2, Activity, AlertTriangle, Clock, Globe, ChevronDown, Ban, Eye, EyeOff, Settings, Check, X, Search, Timer, Filter, Cpu, Tag } from 'lucide-react'
+import { RefreshCw, ShieldBan, ShieldCheck, Loader2, Activity, AlertTriangle, Clock, Fingerprint, Globe, ChevronDown, Ban, Eye, EyeOff, Settings, Check, X, Search, Timer, Filter, Cpu, Tag } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from './ui/dialog'
@@ -323,6 +323,8 @@ export function RealtimeRanking() {
   const [sharedIps, setSharedIps] = useState<SharedIPItem[]>([])
   const [multiIpTokens, setMultiIpTokens] = useState<MultiIPTokenItem[]>([])
   const [multiIpUsers, setMultiIpUsers] = useState<MultiIPUserItem[]>([])
+  const [fpAccounts, setFpAccounts] = useState<Array<{ ip: string; device_fp: string; user_count: number; request_count: number; geo_label?: string }>>([])
+  const [fpIPs, setFpIPs] = useState<Array<{ user_id: number; username: string; ip_count: number; request_count: number }>>([])
 
   // Pagination for IP monitoring
   const [ipPage, setIpPage] = useState({ shared: 1, tokens: 1, users: 1 })
@@ -703,24 +705,30 @@ export function RealtimeRanking() {
     }
     const noCache = forceRefresh ? '&no_cache=true' : ''
     try {
-      const [statsRes, sharedRes, tokensRes, usersRes] = await Promise.all([
+      const [statsRes, sharedRes, tokensRes, usersRes, fpAccountsRes, fpIPsRes] = await Promise.all([
         fetch(`${apiUrl}/api/ip/stats`, { headers: getAuthHeaders() }),
         fetch(`${apiUrl}/api/ip/shared-ips?window=${ipWindow}&min_tokens=2&limit=200${noCache}`, { headers: getAuthHeaders() }),
         fetch(`${apiUrl}/api/ip/multi-ip-tokens?window=${ipWindow}&min_ips=2&limit=200${noCache}`, { headers: getAuthHeaders() }),
         fetch(`${apiUrl}/api/ip/multi-ip-users?window=${ipWindow}&min_ips=3&limit=200${noCache}`, { headers: getAuthHeaders() }),
+        fetch(`${apiUrl}/api/fingerprint/same-ip-accounts?window=${ipWindow}&min_users=2&limit=200`, { headers: getAuthHeaders() }),
+        fetch(`${apiUrl}/api/fingerprint/same-account-ips?window=${ipWindow}&min_ips=2&limit=200`, { headers: getAuthHeaders() }),
       ])
 
-      const [stats, shared, tokens, users] = await Promise.all([
+      const [stats, shared, tokens, users, fpAccounts, fpIPs] = await Promise.all([
         statsRes.json(),
         sharedRes.json(),
         tokensRes.json(),
         usersRes.json(),
+        fpAccountsRes.json(),
+        fpIPsRes.json(),
       ])
 
       if (stats.success) setIpStats(stats.data)
       if (shared.success) setSharedIps(shared.data?.items || [])
       if (tokens.success) setMultiIpTokens(tokens.data?.items || [])
       if (users.success) setMultiIpUsers(users.data?.items || [])
+      if (fpAccounts.success) setFpAccounts(fpAccounts.data?.items || [])
+      if (fpIPs.success) setFpIPs(fpIPs.data?.items || [])
 
       if (showSuccessToast) showToast('success', '已刷新')
     } catch (e) {
@@ -2586,6 +2594,60 @@ export function RealtimeRanking() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* 设备指纹风控 */}
+            <Card className="rounded-xl border shadow-sm overflow-hidden">
+              <CardHeader className="pb-3 border-b bg-muted/20">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Fingerprint className="h-4 w-4 text-purple-500" />
+                  设备指纹风控
+                  <Badge variant="secondary" className="ml-2 bg-background font-mono">{fpAccounts.length + fpIPs.length}</Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-0">
+                <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x">
+                  <div className="p-4">
+                    <h4 className="text-sm font-semibold text-muted-foreground mb-2 flex items-center gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 text-red-500" /> 同 IP 多账号
+                      <Badge variant="outline" className="font-mono">{fpAccounts.length}</Badge>
+                    </h4>
+                    {fpAccounts.length > 0 ? (
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {fpAccounts.map((item) => (
+                          <div key={item.ip} className="flex items-center justify-between text-xs">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{item.ip}</code>
+                              {item.geo_label && <span className="text-muted-foreground truncate">{item.geo_label}</span>}
+                            </div>
+                            <span className="text-red-600 dark:text-red-400 font-semibold tabular-nums whitespace-nowrap">{item.user_count} 账号</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-muted-foreground italic">无</div>
+                    )}
+                  </div>
+                  <div className="p-4">
+                    <h4 className="text-sm font-semibold text-muted-foreground mb-2 flex items-center gap-1.5">
+                      <Globe className="h-3.5 w-3.5 text-orange-500" /> 同账号多 IP
+                      <Badge variant="outline" className="font-mono">{fpIPs.length}</Badge>
+                    </h4>
+                    {fpIPs.length > 0 ? (
+                      <div className="space-y-2 max-h-64 overflow-y-auto">
+                        {fpIPs.map((item) => (
+                          <div key={item.user_id} className="flex items-center justify-between text-xs">
+                            <span className="truncate">{item.username || `用户#${item.user_id}`}</span>
+                            <span className="text-orange-600 dark:text-orange-400 font-semibold tabular-nums whitespace-nowrap">{item.ip_count} IP</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-muted-foreground italic">无</div>
+                    )}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
 
             {ipLoading ? (
               <div className="h-64 flex items-center justify-center text-muted-foreground">

@@ -999,8 +999,9 @@ do_update_interactive() {
   # 更新代码
   if [[ -d ".git" ]]; then
     log_info "更新代码..."
-    git fetch origin 2>/dev/null || true
-    git reset --hard origin/main 2>/dev/null || log_warn "代码更新跳过"
+    git remote set-url origin "$REPO_URL" || die "无法切换到优化版仓库"
+    git fetch origin main || die "拉取优化版失败，保留当前运行服务"
+    git reset --hard origin/main || die "切换优化版代码失败"
   fi
 
   # GeoIP 可选下载（#25，默认询问/跳过，不阻塞更新）
@@ -1016,13 +1017,13 @@ do_update_interactive() {
   # 根据 .env 自动选择 compose 文件（host 模式叠加 overlay）
   setup_compose_files "$project_dir"
 
-  # 拉取最新镜像并重启
-  log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE pull
+  # 编译成功前不停止旧服务，禁止回退上游预构建镜像。
+  log_info "从优化版源码构建..."
+  $DOCKER_COMPOSE build --pull newapi-tools || die "源码构建失败，保留当前服务"
+  $DOCKER_COMPOSE pull redis || die "Redis 镜像拉取失败"
 
-  log_info "重启服务..."
-  $DOCKER_COMPOSE down
-  $DOCKER_COMPOSE up -d
+  log_info "重建服务..."
+  $DOCKER_COMPOSE up -d --no-build --force-recreate || die "服务启动失败"
 
   log_success "更新完成!"
   echo ""
@@ -1317,8 +1318,9 @@ clone_or_update_project() {
   if [[ -d "$target_dir" ]]; then
     log_info "项目已存在，正在更新..."
     cd "$target_dir"
-    git fetch origin
-    git reset --hard origin/main
+    git remote set-url origin "$REPO_URL" || die "无法切换到优化版仓库"
+    git fetch origin main || die "拉取优化版失败"
+    git reset --hard origin/main || die "切换优化版代码失败"
     log_success "项目已更新到最新版本"
   else
     log_info "正在克隆项目到: $target_dir"
@@ -1663,13 +1665,12 @@ quick_update() {
     compose_args+=(-f "$compose_file")
   fi
 
-  # 拉取最新镜像
-  log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${compose_args[@]}" pull
+  log_info "从优化版源码构建..."
+  $DOCKER_COMPOSE "${compose_args[@]}" build --pull newapi-tools || die "源码构建失败，保留当前服务"
+  $DOCKER_COMPOSE "${compose_args[@]}" pull redis || die "Redis 镜像拉取失败"
 
-  log_info "重启服务..."
-  $DOCKER_COMPOSE "${compose_args[@]}" down
-  $DOCKER_COMPOSE "${compose_args[@]}" up -d
+  log_info "重建服务..."
+  $DOCKER_COMPOSE "${compose_args[@]}" up -d --no-build --force-recreate || die "服务启动失败"
 
   # 确保容器连接到 NewAPI 网络（host 模式下 NEWAPI_NETWORK 为空，跳过）
   local newapi_network

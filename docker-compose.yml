@@ -13,6 +13,7 @@ services:
     build:
       context: .
     image: newapi-tools:local
+    pull_policy: never
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：

@@ -1023,6 +1023,10 @@ start_services() {
   # GeoIP 可选（#25）
   maybe_download_geoip_database
 
+  # 先构建，失败不停止原有服务。
+  log_info "从优化版源码构建..."
+  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" build --pull newapi-tools || die "源码构建失败，保留当前服务"
+
   # 检查是否有旧容器
   if docker ps -a --format '{{.Names}}' | grep -qE '^newapi-tools$'; then
     log_warn "发现已存在的服务容器，正在停止..."
@@ -1033,7 +1037,7 @@ start_services() {
 
   # 拉取最新镜像
   log_info "拉取最新镜像..."
-  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull
+  $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" pull redis || die "Redis 镜像拉取失败"
 
   # 启动服务
   $DOCKER_COMPOSE "${COMPOSE_FILES[@]}" --env-file "$ENV_FILE" up -d

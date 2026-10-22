@@ -5,12 +5,14 @@
 #   2. 通过 deploy.sh 自动部署: ./deploy.sh
 #   3. 手动部署: 复制 .env.example 为 .env 并配置后运行 docker-compose up -d
 #
-# 更新方式:
-#   docker compose pull && docker compose down && docker compose up -d
+# 更新方式（从源码构建）:
+#   git pull && docker compose build && docker compose down && docker compose up -d
 
 services:
   newapi-tools:
-    image: ghcr.io/james-6-23/new_api_tools:latest
+    build:
+      context: .
+    image: newapi-tools:local
     container_name: newapi-tools
     ports:
       # FRONTEND_BIND 控制端口绑定的网卡：
